@@ -1,186 +1,194 @@
 # Parsec Cloud (https://parsec.cloud) Copyright (c) AGPLv3 2019 Scille SAS
 
-from PyQt5.QtCore import pyqtSignal, QPoint
-from PyQt5.QtWidgets import QToolTip, QWidget, QApplication
+from uuid import UUID
+
+from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtGui import QFontMetrics
+from PyQt5.QtWidgets import QWidget, QApplication
 
 from structlog import get_logger
 
-from parsec.api.protocol import DeviceID, DeviceName
-from parsec.core.types import BackendOrganizationClaimDeviceAddr
-from parsec.core.invite_claim import (
-    InviteClaimTimeoutError,
-    InviteClaimBackendOfflineError,
-    InviteClaimError,
-    generate_invitation_token as core_generate_invitation_token,
-    invite_and_create_device as core_invite_and_create_device,
-)
+from parsec.api.protocol import InvitationType, InvitationStatus, InvitationDeletedReason
+from parsec.core.types import BackendInvitationAddr
+
+from parsec.core.backend_connection import backend_authenticated_cmds_factory
 from parsec.core.gui import desktop
-from parsec.core.gui import validators
-from parsec.core.gui.custom_dialogs import show_info, show_error, GreyedDialog
+from parsec.core.gui.custom_dialogs import show_error, GreyedDialog
 from parsec.core.gui.lang import translate as _
+from parsec.core.gui.trio_thread import JobResultError, ThreadSafeQtSignal, QtToTrioJob
 from parsec.core.gui.ui.invite_device_widget import Ui_InviteDeviceWidget
-from parsec.core.gui.trio_thread import JobResultError, ThreadSafeQtSignal
+from parsec.core.gui.ui.device_invitation_widget import Ui_DeviceInvitationWidget
 
 
 logger = get_logger()
 
 
-async def _do_registration(core, device, new_device_name, token):
-    try:
-        new_device_name = DeviceName(new_device_name)
-    except ValueError as exc:
-        raise JobResultError("registration-invite-bad-value") from exc
-
-    try:
-        await core_invite_and_create_device(
-            device=device,
-            new_device_name=new_device_name,
-            token=token,
-            keepalive=core.config.backend_connection_keepalive,
+async def _do_invite_device(device, config):
+    async with backend_authenticated_cmds_factory(
+        addr=device.organization_addr,
+        device_id=device.device_id,
+        signing_key=device.signing_key,
+        keepalive=config.backend_connection_keepalive,
+    ) as cmds:
+        rep = await cmds.invite_new(type=InvitationType.DEVICE)
+        if rep["status"] != "ok":
+            raise JobResultError(rep["status"])
+        action_addr = BackendInvitationAddr.build(
+            backend_addr=device.organization_addr,
+            organization_id=device.organization_id,
+            invitation_type=InvitationType.DEVICE,
+            token=rep["token"],
         )
-    except InviteClaimTimeoutError:
-        raise JobResultError("registration-invite-timeout")
-    except InviteClaimBackendOfflineError as exc:
-        raise JobResultError("registration-invite-offline") from exc
-    except InviteClaimError as exc:
-        if "already_exists" in str(exc):
-            raise JobResultError("already_exists")
-        raise JobResultError("registration-invite-error", info=str(exc))
-    return new_device_name, token
+        return action_addr
+
+
+async def _do_list_invitations(device, config):
+    async with backend_authenticated_cmds_factory(
+        addr=device.organization_addr,
+        device_id=device.device_id,
+        signing_key=device.signing_key,
+        keepalive=config.backend_connection_keepalive,
+    ) as cmds:
+        rep = await cmds.invite_list()
+        if rep["status"] != "ok":
+            raise JobResultError(rep["status"])
+        invs = [inv for inv in rep["invitations"] if inv["type"] == InvitationType.DEVICE]
+        if len(invs):
+            return invs[0]
+        return None
+
+
+async def _do_cancel_invitation(device, config, token):
+    async with backend_authenticated_cmds_factory(
+        addr=device.organization_addr,
+        device_id=device.device_id,
+        signing_key=device.signing_key,
+        keepalive=config.backend_connection_keepalive,
+    ) as cmds:
+        rep = await cmds.invite_delete(token=token, reason=InvitationDeletedReason.CANCELLED)
+        if rep["status"] != "ok":
+            raise JobResultError(rep["status"])
 
 
 class InviteDeviceWidget(QWidget, Ui_InviteDeviceWidget):
-    registration_success = pyqtSignal()
-    registration_error = pyqtSignal()
+    invite_device_success = pyqtSignal(QtToTrioJob)
+    invite_device_error = pyqtSignal(QtToTrioJob)
+    list_invitations_success = pyqtSignal(QtToTrioJob)
+    list_invitations_error = pyqtSignal(QtToTrioJob)
+    cancel_invitation_success = pyqtSignal(QtToTrioJob)
+    cancel_invitation_error = pyqtSignal(QtToTrioJob)
 
-    def __init__(self, core, jobs_ctx, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, core, jobs_ctx):
+        super().__init__()
         self.setupUi(self)
         self.core = core
         self.dialog = None
         self.jobs_ctx = jobs_ctx
-        self.registration_job = None
-        self.widget_registration.hide()
-        self.button_register.clicked.connect(self.register_device)
-        self.button_copy_device.clicked.connect(
-            self.copy_field(self.button_copy_device, self.line_edit_device)
-        )
-        self.button_copy_token.clicked.connect(
-            self.copy_field(self.button_copy_token, self.line_edit_token)
-        )
-        self.button_copy_url.clicked.connect(
-            self.copy_field(self.button_copy_url, self.line_edit_url)
-        )
-        self.button_copy_device.apply_style()
-        self.button_copy_token.apply_style()
-        self.button_copy_url.apply_style()
-        self.registration_success.connect(self.on_registration_success)
-        self.registration_error.connect(self.on_registration_error)
-        self.line_edit_device_name.setValidator(validators.DeviceNameValidator())
+        self.list_invitations_success.connect(self._on_list_invitations_success)
+        self.list_invitations_error.connect(self._on_list_invitations_error)
+        self.invite_device_success.connect(self._on_invite_device_success)
+        self.invite_device_error.connect(self._on_invite_device_error)
+        self.cancel_invitation_success.connect(self._on_cancel_invitation_success)
+        self.cancel_invitation_error.connect(self._on_cancel_invitation_error)
+        self.button_invite_device.clicked.connect(self.invite_device)
+        self.invite_addr = None
+        self.button_copy_to_clipboard.clicked.connect(self._on_copy_invitation_clicked)
+        self.button_cancel_invite.clicked.connect(self._on_cancel_invitation_clicked)
+        self.list_invitations()
 
-    def on_close(self):
-        self.cancel_registration()
-
-    def copy_field(self, button, widget):
-        def _inner_copy_field():
-            desktop.copy_to_clipboard(widget.text())
-            QToolTip.showText(
-                button.mapToGlobal(QPoint(0, 0)), _("TEXT_INVITE_DEVICE_COPIED_TO_CLIPBOARD")
-            )
-
-        return _inner_copy_field
-
-    def on_registration_error(self):
-        self.line_edit_token.setText("")
-        self.line_edit_url.setText("")
-        self.line_edit_device.setText("")
-        self.widget_registration.hide()
-        self.button_register.show()
-        self.line_edit_device_name.show()
-
-        if not self.registration_job:
-            return
-
-        assert self.registration_job.is_finished()
-
-        status = self.registration_job.status
-        if status == "cancelled":
-            return
-
-        if status == "registration-invite-bad-value":
-            errmsg = _("TEXT_INVITE_DEVICE_BAD_DEVICE_NAME")
-        elif status == "already_exists":
-            errmsg = _("TEXT_INVITE_DEVICE_ALREADY_EXISTS")
-        elif status == "registration-invite-offline":
-            errmsg = _("TEXT_INVITE_DEVICE_HOST_OFFLINE")
-        elif status == "registration-invite-error":
-            errmsg = _("TEXT_INVITE_DEVICE_WRONG_PARAMETERS")
-        elif status == "registration-invite-timeout":
-            errmsg = _("TEXT_INVITE_DEVICE_TIMEOUT")
-        else:
-            errmsg = _("TEXT_INVITE_DEVICE_UNKNOWN_FAILURE")
-        show_error(self, errmsg, exception=self.registration_job.exc)
-
-    def on_registration_success(self):
-        assert self.registration_job.is_finished()
-        assert self.registration_job.status == "ok"
-        show_info(self, _("TEXT_INVITE_DEVICE_SUCCESS"))
-        self.registration_job = None
-        if self.dialog:
-            self.dialog.accept()
-        elif QApplication.activeModalWidget():
-            QApplication.activeModalWidget().accept()
-        else:
-            logger.warning("Cannot close dialog when inviting device")
-
-    def cancel_registration(self):
-        if self.registration_job:
-            self.registration_job.cancel_and_join()
-
-    def register_device(self):
-        if not self.line_edit_device_name.text():
-            show_error(self, _("TEXT_INVITE_DEVICE_EMPTY_DEVICE_NAME"))
-            return
-
-        try:
-            new_device_id = DeviceID(
-                f"{self.core.device.user_id}@{self.line_edit_device_name.text()}"
-            )
-        except ValueError as exc:
-            show_error(self, _("TEXT_INVITE_DEVICE_BAD_DEVICE_NAME"), exception=exc)
-            return
-        token = core_generate_invitation_token()
-        try:
-            addr = BackendOrganizationClaimDeviceAddr.build(
-                self.core.device.organization_addr, device_id=new_device_id
-            )
-        except ValueError as exc:
-            show_error(self, _("TEXT_INVITE_DEVICE_WRONG_PARAMETERS"), exception=exc)
-            return
-
-        self.line_edit_device.setText(new_device_id.device_name)
-        self.line_edit_device.setCursorPosition(0)
-        self.line_edit_token.setText(token)
-        self.line_edit_token.setCursorPosition(0)
-        self.line_edit_url.setText(addr.to_url())
-        self.line_edit_url.setCursorPosition(0)
-        self.widget_registration.show()
-        self.registration_job = self.jobs_ctx.submit_job(
-            ThreadSafeQtSignal(self, "registration_success"),
-            ThreadSafeQtSignal(self, "registration_error"),
-            _do_registration,
-            core=self.core,
+    def list_invitations(self):
+        self.jobs_ctx.submit_job(
+            ThreadSafeQtSignal(self, "list_invitations_success", QtToTrioJob),
+            ThreadSafeQtSignal(self, "list_invitations_error", QtToTrioJob),
+            _do_list_invitations,
             device=self.core.device,
-            new_device_name=new_device_id.device_name,
+            config=self.core.config,
+        )
+
+    def invite_device(self):
+        self.jobs_ctx.submit_job(
+            ThreadSafeQtSignal(self, "invite_device_success", QtToTrioJob),
+            ThreadSafeQtSignal(self, "invite_device_error", QtToTrioJob),
+            _do_invite_device,
+            device=self.core.device,
+            config=self.core.config,
+        )
+
+    def cancel_invitation(self, token):
+        self.jobs_ctx.submit_job(
+            ThreadSafeQtSignal(self, "cancel_invitation_success", QtToTrioJob),
+            ThreadSafeQtSignal(self, "cancel_invitation_error", QtToTrioJob),
+            _do_cancel_invitation,
+            device=self.core.device,
+            config=self.core.config,
             token=token,
         )
-        self.line_edit_device_name.hide()
-        self.button_register.hide()
+
+    def _on_cancel_invitation_success(self, job):
+        self.list_invitations()
+
+    def _on_cancel_invitation_error(self, job):
+        pass
+
+    def _on_invite_device_success(self, job):
+        self.list_invitations()
+
+    def _on_invite_device_error(self, job):
+        pass
+
+    def _on_list_invitations_success(self, job):
+        STATUS_TEXTS = {
+            InvitationStatus.READY: (
+                _("TEXT_INVITATION_STATUS_READY"),
+                _("TEXT_INVITATION_STATUS_READY_TOOLTIP"),
+            ),
+            InvitationStatus.IDLE: (
+                _("TEXT_INVITATION_STATUS_IDLE"),
+                _("TEXT_INVITATION_STATUS_IDLE_TOOLTIP"),
+            ),
+            InvitationStatus.DELETED: (
+                _("TEXT_INVITATION_STATUS_CANCELLED"),
+                _("TEXT_INVITATION_STATUS_CANCELLED_TOOLTIP"),
+            ),
+        }
+
+        invitation = job.ret
+
+        if not invitation:
+            self.widget_invitation.hide()
+            return
+
+        self.widget_invitation.show()
+        self.invite_addr = BackendInvitationAddr.build(
+            backend_addr=self.core.device.organization_addr,
+            organization_id=self.core.device.organization_id,
+            invitation_type=InvitationType.DEVICE,
+            token=invitation["token"],
+        )
+        font = QApplication.font()
+        metrics = QFontMetrics(font)
+        invite_addr = str(self.invite_addr)
+        if metrics.horizontalAdvance(invite_addr) > self.label_invite_addr.width():
+            while metrics.horizontalAdvance(invite_addr + "...") > self.label_invite_addr.width():
+                invite_addr = invite_addr[: len(invite_addr) - 1]
+            invite_addr += "..."
+        self.label_invite_addr.setText(invite_addr)
+        self.label_invite_addr.setToolTip(str(self.invite_addr))
+        self.label_invite_status.setText(STATUS_TEXTS[invitation["status"]][0])
+        self.label_invite_status.setToolTip(STATUS_TEXTS[invitation["status"]][1])
+
+    def _on_list_invitations_error(self, job):
+        show_error(self, "List failed")
+
+    def _on_copy_invitation_clicked(self):
+        desktop.copy_to_clipboard(str(self.invite_addr))
+
+    def _on_cancel_invitation_clicked(self):
+        self.cancel_invitation(self.invite_addr.token)
 
     @classmethod
     def exec_modal(cls, core, jobs_ctx, parent):
         w = cls(core=core, jobs_ctx=jobs_ctx)
-        d = GreyedDialog(w, title=_("TEXT_INVITE_DEVICE_TITLE"), parent=parent)
+        d = GreyedDialog(w, title=_("TEXT_INVITE_DEVICE_TITLE"), parent=parent, width=1000)
         w.dialog = d
-        w.line_edit_device_name.setFocus()
         return d.exec_()

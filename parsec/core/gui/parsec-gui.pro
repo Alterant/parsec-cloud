@@ -46,7 +46,18 @@ FORMS += forms/main_window.ui \
     forms/file_history_button.ui \
     forms/create_org_first_page_widget.ui \
     forms/create_org_widget.ui \
-    forms/create_org_second_page_widget.ui
+    forms/create_org_second_page_widget.ui \
+    forms/user_invitation_widget.ui \
+    forms/device_invitation_widget.ui \
+    forms/greet_user_widget.ui \
+    forms/claim_user_code_exchange_widget.ui \
+    forms/claim_user_finalize_widget.ui \
+    forms/claim_user_instructions_widget.ui \
+    forms/claim_user_provide_info_widget.ui \
+    forms/greet_user_instructions_widget.ui \
+    forms/greet_user_code_exchange_widget.ui \
+    forms/greet_user_check_info_widget.ui \
+    forms/code_input_widget.ui
 
 RESOURCES += rc/resources.qrc \
     forms/rc/resources.qrc
